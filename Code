@@ -1,0 +1,1080 @@
+import math, os, random
+import numpy as np
+
+from panda3d.core import loadPrcFileData
+loadPrcFileData("", "sync-video 0")
+loadPrcFileData("", "clock-mode limited")
+loadPrcFileData("", "clock-frame-rate 60")
+
+from direct.actor.Actor             import Actor
+from direct.gui.DirectGui           import DirectButton, DirectFrame
+from direct.gui.OnscreenText        import OnscreenText
+from direct.interval.IntervalGlobal import LerpHprInterval, LerpPosInterval, Sequence
+from direct.showbase.ShowBase       import ShowBase
+from direct.task                    import Task
+from panda3d.core                   import (AmbientLight, DirectionalLight,
+                                            LVector3, TextNode, Vec4)
+
+# ── World / gameplay constants ─────────────────────────────────────────────────
+WL, WR, WB, WT = -40.0, 40.0, -40.0, 50.0
+PLAYER_SPEED, PLAYER_SIZE, PLAYER_START = 8.0, 0.3, (0.0, -32.0, 0.5)
+PLAYER_ACCEL, PLAYER_FRIC = 60.0, 8.0
+TREE_X, TREE_Y, TREE_R    = 0.0, 10.0, 2.5
+EGGS_START, EGGS_MIN, PICKUP_DIST = 28, 14, 2.0
+GAP_CHICKENS  = 2.4
+JUMP_H, JUMP_T = 1.5, 0.5
+BOB_SPD, BOB_H = 12.0, 0.06
+BODY_TILT, BODY_PITCH, LEG_SWING = 4.0, 3.0, 35.0
+GAME_LEN = 120
+
+AI_MIN_SPD, AI_MAX_SPD = 4.8, 6.8
+AI_ACCEL, AI_TURN       = 45.0, 0.22
+AI_SPRINT_P, AI_SPRINT_MUL, AI_SPRINT_DUR = 0.22, 1.40, (0.30, 0.90)
+AI_STEAL_R, AI_PAUSE_P, AI_PAUSE_DUR      = 5.5, 0.06, (0.12, 0.40)
+
+WALK, IDLE, JUMP, EAT = "walk", "idle", "jump", "eat"
+
+AI_CHICKENS = [
+    ("Player 1", (1.0, 0.4, 0.4, 1), "chicken.glb",  0.3, 0.3, True,    0),
+    ("Player 2", (0.4, 1.0, 0.5, 1), "chicken2.glb", 0.3, 0.5, True,  0),
+    ("Player 4", (1.0, 0.7, 0.3, 1), "chicken4.glb", 0.3, 0.5, False, 0),
+]
+ANIM_KEYS = [
+    ("1","Idle",True),("2","Idle1",True),("3","Idle2",True),("4","Standing",True),
+    ("5","Walking",True),("6","Screaming",True),("7","Dying",False),
+    ("8","Pecking.Begin",False),("9","Pecking.End",False),("0","Pecking.001",False),
+    ("z","Pecking.002",False),("x","Pecking.003",False),
+]
+
+# ── Palette ────────────────────────────────────────────────────────────────────
+yellow      = (0.95, 0.85, 0.10, 1);  panel_row = (0.11, 0.11, 0.11, 0.97)
+btn_dark    = (0.12, 0.12, 0.12, 1);  white     = (1, 1, 1, 1)
+grey        = (0.6,  0.6,  0.6,  1);  dark_txt  = (0.05, 0.03, 0, 1)
+player_blue = (0.22, 0.74, 0.97, 1);  gold      = (1, 0.7, 0, 1)
+gold_dark   = (0.72, 0.48, 0,    1);  lb_panel  = (0.10, 0.10, 0.12, 1)
+lb_banner   = (0.20, 0.20, 0.22, 1);  row_gold  = (0.95, 0.60, 0, 1)
+row_dark    = (0.16, 0.16, 0.20, 1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  GAME TIMER HUD
+# ─────────────────────────────────────────────────────────────────────────────
+class GameTimer:
+    _BG        = (0.06, 0.06, 0.08, 0.97)
+    _CAPSULE   = (0.10, 0.10, 0.13, 1.00)
+    _BORDER_HI = (0.95, 0.85, 0.10, 1.00)
+    _BORDER_LO = (0.28, 0.24, 0.04, 1.00)
+    _BAR_FULL  = (0.95, 0.85, 0.10, 1.00)
+    _BAR_MID   = (0.95, 0.55, 0.10, 1.00)
+    _BAR_LOW   = (0.88, 0.16, 0.10, 1.00)
+    _BAR_EMPTY = (0.13, 0.13, 0.17, 1.00)
+    _GHOST     = (0.18, 0.16, 0.06, 1.00)
+    _TXT_NORM  = (1.00, 1.00, 1.00, 1.00)
+    _TXT_WARN  = (1.00, 0.72, 0.18, 1.00)
+    _TXT_URG   = (1.00, 0.26, 0.12, 1.00)
+    _CORNER    = (0.95, 0.85, 0.10, 1.00)
+    _W, _H, _BRD, _SEGS = 0.285, 0.155, 0.005, 12
+    _SEG_H, _SEG_G      = 0.013, 0.004
+    _AX, _AY            = 1.285, 0.870
+
+    def __init__(self, parent, total_secs, font, font_ui, on_expire, font_digital=None):
+        self.total_secs = self.time_left = float(total_secs)
+        self.font_digital = font_digital or font
+        self.on_expire    = on_expire
+        self._expired = self._colon_vis = False
+        self._last_sec = -1; self._colon_acc = 0.0
+        self._colon_vis = True
+
+        W, H, BRD = self._W, self._H, self._BRD
+        ax, ay    = self._AX, self._AY
+        strip_bot = -H - BRD - self._SEG_H - 0.004
+
+        self._root = DirectFrame(parent=parent, frameColor=(0,0,0,0),
+            frameSize=(-W-BRD, W+BRD, strip_bot, H+BRD+0.004), pos=(ax, 0, ay))
+
+        # Border edges
+        DirectFrame(parent=self._root, frameColor=self._BORDER_HI,
+                    frameSize=(-W-BRD, W+BRD, H, H+BRD))
+        for fs, clr in [
+            ((-W-BRD, W+BRD, -H-BRD, -H), self._BORDER_LO),
+            ((-W-BRD, -W, -H, H),          self._BORDER_LO),
+            ((W, W+BRD, -H, H),            self._BORDER_LO),
+            ((-W, W, -H, H),               self._BG),
+        ]:
+            DirectFrame(parent=self._root, frameColor=clr, frameSize=fs)
+
+        # Corner L-bracket accents
+        cw, ch, ct = 0.042, 0.030, 0.005
+        for bx, by, sx, sy in ((-W, H, 1,-1), (W, H,-1,-1), (-W,-H, 1, 1), (W,-H,-1, 1)):
+            DirectFrame(parent=self._root, frameColor=self._CORNER,
+                        frameSize=(0, sx*cw, 0, sy*ct), pos=(bx,0,by))
+            DirectFrame(parent=self._root, frameColor=self._CORNER,
+                        frameSize=(0, sx*ct, 0, sy*ch), pos=(bx,0,by))
+
+        # Capsule label row
+        cap_y = H * 0.52
+        DirectFrame(parent=self._root, frameColor=self._CAPSULE,
+                    frameSize=(-W*0.82, W*0.82, -0.026, 0.026), pos=(0,0,cap_y))
+        for dx in (-W*0.68, W*0.68):
+            DirectFrame(parent=self._root, frameColor=self._BORDER_HI,
+                        frameSize=(-0.010, 0.010, -0.010, 0.010), pos=(dx, 0, cap_y))
+        OnscreenText(text="TIME  REMAIN", parent=self._root,
+                     pos=(0, cap_y-0.011), scale=0.030, fg=(1,1,1,1),
+                     align=TextNode.ACenter, font=font or font_ui, mayChange=False)
+
+        # timer
+        OnscreenText(text="88:88", parent=self._root, pos=(0, -H*0.08),
+                     scale=0.108, fg=self._GHOST, align=TextNode.ACenter,
+                     font=self.font_digital, mayChange=False)
+        self._time_text = OnscreenText(
+            text=self._fmt(self.total_secs), parent=self._root, pos=(0, -H*0.08),
+            scale=0.108, fg=self._TXT_NORM, align=TextNode.ACenter,
+            font=self.font_digital, mayChange=True)
+
+        DirectFrame(parent=self._root, frameColor=(0.22,0.20,0.08,0.55),
+                    frameSize=(-W*0.82, W*0.82, -0.003, 0), pos=(0,0,-H*0.72))
+
+        # Segmented progress strip
+        seg_w  = (2*W - (self._SEGS-1)*self._SEG_G) / self._SEGS
+        strip_y = -H - BRD - self._SEG_H - 0.002
+        self._seg_fills = []
+        for i in range(self._SEGS):
+            lx = -W + i*(seg_w + self._SEG_G); rx = lx + seg_w
+            DirectFrame(parent=self._root, frameColor=self._BAR_EMPTY,
+                        frameSize=(lx, rx, 0, self._SEG_H), pos=(0,0,strip_y))
+            fill = DirectFrame(parent=self._root, frameColor=self._BAR_FULL,
+                               frameSize=(lx, rx, 0, self._SEG_H), pos=(0,0,strip_y))
+            self._seg_fills.append((fill, lx, rx))
+
+    def update(self, dt: float, active: bool) -> None:
+        if not active or self._expired:
+            return
+        self.time_left = max(0.0, self.time_left - dt)
+        cur_sec = int(math.ceil(self.time_left))
+
+        self._colon_acc += dt
+        if self._colon_acc >= 0.5:
+            self._colon_acc -= 0.5
+            self._colon_vis = not self._colon_vis
+
+        if cur_sec != self._last_sec:
+            self._last_sec = cur_sec
+            sep = ":" if self._colon_vis else " "
+            m, s = cur_sec // 60, cur_sec % 60
+            self._time_text.setText(f"{m:02d}{sep}{s:02d}")
+            clr = (self._TXT_URG  if self.time_left <= 10.0 else
+                   self._TXT_WARN if self.time_left <= 30.0 else self._TXT_NORM)
+            self._time_text.setFg(clr)
+
+        frac = self.time_left / self.total_secs if self.total_secs > 0 else 0.0
+        lit  = int(round(frac * self._SEGS))
+        bar_clr = (self._BAR_LOW  if self.time_left <= 10.0 else
+                   self._BAR_MID  if self.time_left <= 30.0 else self._BAR_FULL)
+        for idx, (fill, lx, rx) in enumerate(self._seg_fills):
+            fill["frameColor"] = bar_clr
+            fill["frameSize"]  = (lx, rx, 0, self._SEG_H) if idx < lit else (lx, lx, 0, self._SEG_H)
+
+        if self.time_left <= 0 and not self._expired:
+            self._expired = True
+            self._time_text.setText("00:00")
+            if callable(self.on_expire):
+                self.on_expire()
+
+    def reset(self, total_secs: float = None) -> None:
+        if total_secs is not None:
+            self.total_secs = float(total_secs)
+        self.time_left = self.total_secs
+        self._expired = False; self._last_sec = -1
+        self._colon_acc = 0.0; self._colon_vis = True
+        self._time_text.setText(self._fmt(self.total_secs))
+        self._time_text.setFg(self._TXT_NORM)
+        for fill, lx, rx in self._seg_fills:
+            fill["frameColor"] = self._BAR_FULL
+            fill["frameSize"]  = (lx, rx, 0, self._SEG_H)
+
+    def show(self):    self._root.show()
+    def hide(self):    self._root.hide()
+    def destroy(self):
+        try: self._root.destroy()
+        except Exception: pass
+
+    @staticmethod
+    def _fmt(seconds: float) -> str:
+        s = int(math.ceil(seconds))
+        return f"{s//60:02d}:{s%60:02d}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+def _try_download_font(filename, url):
+    dest = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    if os.path.exists(dest):
+        return True
+    try:
+        import urllib.request
+        print(f"Downloading font: {filename} ...")
+        urllib.request.urlretrieve(url, dest)
+        return True
+    except Exception as e:
+        print(f"Font download failed ({filename}): {e}")
+        return False
+
+def find_font(app, *names):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    dirs = [script_dir, ".", "fonts", "assets/fonts",
+            "/usr/share/fonts", "/usr/share/fonts/truetype", "/usr/share/fonts/opentype",
+            "/usr/local/share/fonts", os.path.expanduser("~/.fonts"),
+            os.path.expanduser("~/.local/share/fonts"),
+            "C:/Windows/Fonts", "/Library/Fonts", "/System/Library/Fonts",
+            os.path.expanduser("~/Library/Fonts")]
+    for name in names:
+        for d in dirs:
+            for path in [os.path.join(d, name)] + (
+                    [os.path.join(d, sub, name) for sub in os.listdir(d)]
+                    if os.path.isdir(d) else []):
+                if os.path.exists(path):
+                    try: return app.loader.loadFont(path)
+                    except: pass
+
+def load_model(loader, *paths):
+    for p in paths:
+        try: return loader.loadModel(p)
+        except: pass
+
+def load_actor(path):
+    try:
+        a = Actor(path); clips = a.getAnimNames()
+        print(f"Actor: {path}  clips={clips}")
+        return a, clips, True
+    except Exception as e:
+        print(f"Actor failed ({path}): {e}")
+        return None, [], False
+
+def anim_variants(name):
+    return (name, name.capitalize(), name.upper(),
+            f"Armature|{name}", f"Armature|{name.capitalize()}")
+
+def play_anim(actor, clips, name, loop=True):
+    for v in anim_variants(name):
+        if v in clips:
+            actor.loop(v) if loop else actor.play(v)
+            return v
+
+def hpr_seq(node, spd, *hprs):
+    return Sequence(*[LerpHprInterval(node, spd, h) for h in hprs])
+
+def rand_world():
+    return (random.uniform(WL+2, WR-2), random.uniform(WB+2, WT-2))
+
+def pick_clip(clips, *order):
+    for c in order:
+        if c in clips: return c
+    return clips[0] if clips else None
+
+pick_idle = lambda c: pick_clip(c, "Idle", "Idle1", "Standing", "Idle2")
+pick_walk = lambda c: pick_clip(c, "Walking", "Walk", "walking", "Run", "run")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CHICKEN DATA CLASS
+# ─────────────────────────────────────────────────────────────────────────────
+class Chicken:
+    def __init__(self, model, name, color, is_player, clips, is_actor, gz, facing_offset=0):
+        self.model, self.name, self.color = model, name, color
+        self.is_player, self.clips, self.is_actor = is_player, clips, is_actor
+        self.ground_z, self.facing_offset = gz, facing_offset
+        self.score = 0; self.xy = np.zeros(2); self.vel = np.zeros(2)
+        self.jumping = self.moving = self.anim_locked = False
+        self.walk_time = 0.0; self.playing = None; self.leg_l = self.leg_r = None
+        self.idle_clip  = pick_idle(clips) or "Idle"
+        self.idle_timer = random.uniform(4.0, 9.0)
+        if not is_player:
+            self.base_speed   = random.uniform(AI_MIN_SPD, AI_MAX_SPD)
+            self.speed        = self.base_speed
+            self.target_xy    = np.array(rand_world())
+            self.claimed_egg  = None
+            self.wander_angle = random.uniform(0, 360)
+            self.wander_timer = random.uniform(0.3, 1.0)
+            self.pause_timer  = self.wobble_time = self.sprint_timer = 0.0
+            self.sprint_mult  = 1.0
+            self.reaction_lag = random.uniform(0.06, 0.16)
+            self.lag_timer    = 0.0
+
+    def play_clip(self, want, loop=True):
+        if self.is_actor:
+            r = play_anim(self.model, self.clips, want, loop)
+            if r: self.playing = r
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN GAME
+# ─────────────────────────────────────────────────────────────────────────────
+class EggCollectorGame(ShowBase):
+    TASK_NAMES = ("MovePlayer", "MoveAI", "PickupEggs", "Animate",
+                  "MoveCamera", "StartGame", "Countdown", "TimerUpdate")
+
+    def __init__(self):
+        super().__init__()
+        self.music_on = True; self.bgm = None
+        self._time_left = float(GAME_LEN); self._endgame_triggered = False
+
+        self.font = find_font(self,
+            "Poppins-Bold.ttf", "Orbitron-Bold.ttf", "Rajdhani-Bold.ttf",
+            "Ubuntu-Bold.ttf", "DejaVuSans-Bold.ttf", "Arial Bold.ttf", "arialbd.ttf")
+        self.font_ui = find_font(self,
+            "Inter-Regular.otf", "Roboto-Regular.ttf", "Ubuntu-Regular.ttf",
+            "DejaVuSans.ttf", "Arial.ttf", "arial.ttf")
+
+        for fname, url in [
+            ("Rajdhani-Bold.ttf",
+             "https://github.com/google/fonts/raw/main/ofl/rajdhani/Rajdhani-Bold.ttf"),
+            ("Orbitron-Bold.ttf",
+             "https://github.com/google/fonts/raw/main/ofl/orbitron/Orbitron-Bold.ttf"),
+            ("Rajdhani-SemiBold.ttf",
+             "https://github.com/google/fonts/raw/main/ofl/rajdhani/Rajdhani-SemiBold.ttf"),
+        ]:
+            _try_download_font(fname, url)
+
+        if self.font is None:
+            self.font = find_font(self, "Rajdhani-Bold.ttf", "Orbitron-Bold.ttf", "Rajdhani-SemiBold.ttf")
+        if self.font_ui is None:
+            self.font_ui = find_font(self, "Rajdhani-SemiBold.ttf", "Rajdhani-Bold.ttf")
+        self.font_digital = find_font(self,
+            "DSEG7Classic-Bold.ttf", "DSEG7Classic-Regular.ttf", "digital-7.ttf",
+            "Digital7Mono.ttf", "DS-Digital.ttf", "Orbitron-Bold.ttf",
+            "Orbitron-Regular.ttf", "Rajdhani-Bold.ttf") or self.font
+
+        self._setup_music(); self._setup_lights(); self._load_world(); self._place_tree()
+        self._spawn_chickens(); self._spawn_eggs(); self._reset_state()
+        self._build_ui(); self._setup_keys(); self._start_tasks()
+
+    # ── Setup ─────────────────────────────────────────────────────────────────
+
+    def _setup_music(self):
+        music_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_bgm_generated.WAV")
+        try:
+            if os.path.exists(music_file):
+                self.bgm = self.loader.loadMusic(music_file)
+                if self.bgm:
+                    self.bgm.setLoop(True); self.bgm.setVolume(0.55); self.bgm.play()
+        except Exception as e:
+            print(f"Music error: {e}")
+
+    def _toggle_music(self, on):
+        self.music_on = on
+        if self.bgm: (self.bgm.play if on else self.bgm.stop)()
+
+    def _setup_lights(self):
+        self.disableMouse()
+        self.camera.setPos(0, -28, 16); self.camera.setHpr(0, -22, 0)
+        amb = AmbientLight("amb"); amb.setColor(Vec4(.7,.7,.7,1))
+        self.render.setLight(self.render.attachNewNode(amb))
+        sun = DirectionalLight("sun"); sun.setColor(Vec4(1,.95,.85,1))
+        sn = self.render.attachNewNode(sun); sn.setHpr(45,-45,0)
+        self.render.setLight(sn)
+
+    def _load_world(self):
+        for path, scale, pos in (
+            ("models/environment", 0.8, (-28, 80, 0)),
+            ("grass_02.glb", None, (0, 5, 0)),
+        ):
+            m = load_model(self.loader, path)
+            if m:
+                m.reparentTo(self.render)
+                m.setScale(scale or 28, scale or 28, 1)
+                m.setPos(*pos)
+
+    def _place_tree(self):
+        self.tree = load_model(self.loader, "tree.glb", "palm_tree.glb", "models/misc/sphere")
+        if self.tree:
+            self.tree.reparentTo(self.render)
+            self.tree.setScale(2.5, 2.5, 4)
+            self.tree.setPos(TREE_X, TREE_Y, 0)
+
+    def _add_fake_legs(self, chk):
+        for side, x_off, attr in (("l", -.15, "leg_l"), ("r", .15, "leg_r")):
+            pivot = chk.model.attachNewNode(f"leg_{side}"); pivot.setPos(x_off, 0, -.3)
+            leg = load_model(self.loader, "models/misc/sphere", "models/smiley")
+            if leg:
+                bc = chk.model.getColorScale(); leg.reparentTo(pivot)
+                leg.setPos(0, 0, -.15); leg.setScale(.06, .06, .18)
+                leg.setColorScale(max(0, bc[0]*.7), max(0, bc[1]*.7), max(0, bc[2]*.7), 1)
+            setattr(chk, attr, pivot)
+
+    def _make_chicken(self, name, color, path, size, gz, is_player,
+                      fake_legs, x=0, y=0, facing_offset=0):
+        model, clips, is_actor = load_actor(path)
+        if model is None:
+            model = load_model(self.loader, path, "models/smiley")
+            clips, is_actor = [], False
+        model.reparentTo(self.render); model.setScale(size); model.setPos(x, y, gz)
+        chk = Chicken(model, name, color, is_player, clips, is_actor, gz, facing_offset)
+        chk.xy = np.array([float(x), float(y)])
+        if is_actor:
+            best = pick_idle(clips)
+            if best: chk.model.loop(best); chk.playing = best
+            else: chk.play_clip(IDLE)
+        elif fake_legs:
+            self._add_fake_legs(chk)
+        return chk
+
+    def _spawn_chickens(self):
+        self.player = self._make_chicken(
+            "You", player_blue, "rooster.glb", PLAYER_SIZE,
+            PLAYER_START[2], True, False, PLAYER_START[0], PLAYER_START[1])
+        self.chickens = [self.player]
+        for name, color, path, size, gz, fl, foff in AI_CHICKENS:
+            self.chickens.append(
+                self._make_chicken(name, color, path, size, gz, False, fl,
+                                   random.uniform(WL+5, WR-5),
+                                   random.uniform(5, WT-5), foff))
+
+    def _drop_egg(self, x, y):
+        egg = load_model(self.loader, "egg.glb", "models/smiley")
+        if not egg: return
+        egg.reparentTo(self.render); egg.setScale(.35); egg.setPos(x, y, .3)
+        egg.setHpr(random.uniform(0,360), random.uniform(-15,15), random.uniform(-15,15))
+        self.eggs.append(egg)
+
+    def _spawn_eggs(self):
+        self.eggs = []
+        for _ in range(EGGS_START):
+            self._drop_egg(random.uniform(WL+2, WR-2), random.uniform(WB+2, WT-2))
+
+    # ── Spatial ───────────────────────────────────────────────────────────────
+
+    def _push_obstacles(self, x, y, skip=None):
+        def repel(x, y, ox, oy, r):
+            dx, dy = x-ox, y-oy; d = math.hypot(dx, dy)
+            return (ox+dx*r/d, oy+dy*r/d) if 0 < d < r else (x, y)
+        x, y = repel(x, y, TREE_X, TREE_Y, TREE_R)
+        for o in self.chickens:
+            if o is not skip:
+                x, y = repel(x, y, o.model.getX(), o.model.getY(), GAP_CHICKENS)
+        return (max(WL, min(WR, x)), max(WB, min(WT, y)))
+
+    def _move_to(self, chk, nx, ny):
+        nx, ny = self._push_obstacles(nx, ny, skip=chk); chk.xy[:] = nx, ny
+        if chk.jumping: chk.model.setX(nx); chk.model.setY(ny)
+        else:           chk.model.setPos(nx, ny, chk.ground_z)
+
+    def _face(self, chk, dx, dy, turn=0.25):
+        th = math.degrees(math.atan2(dx, -dy)) + chk.facing_offset
+        ch = chk.model.getH()
+        chk.model.setH(ch + ((th - ch + 180) % 360 - 180) * turn)
+
+    # ── State ─────────────────────────────────────────────────────────────────
+
+    def _reset_state(self):
+        self.paused = self.game_over = self.game_started = self.key_guide_on = False
+        self._time_left = float(GAME_LEN); self._endgame_triggered = False
+
+    def _active(self): return not self.paused and not self.game_over
+
+    def _on_game_start(self, task):
+        self.game_started = True
+        return Task.done
+
+    # ── Tasks ─────────────────────────────────────────────────────────────────
+
+    def _tick_countdown(self, task):
+        if not self.game_started or self.paused or self.game_over: return Task.cont
+        self._time_left -= min(globalClock.getDt(), 0.05)
+        if self._time_left < 0: self._time_left = 0
+        return Task.cont
+
+    def _tick_timer_hud(self, task):
+        dt = min(globalClock.getDt(), 0.05)
+        self.game_timer.update(dt, self.game_started and not self.paused and not self.game_over)
+        return Task.cont
+
+    def _tick_player(self, task):
+        if not self._active(): return Task.cont
+        dt = min(globalClock.getDt(), 0.05); p = self.player
+        ix = float(self.held["d"]) - float(self.held["a"])
+        iy = float(self.held["w"]) - float(self.held["s"])
+        il = math.hypot(ix, iy)
+        if il > 0: ix, iy = ix/il, iy/il; p.vel[0] += ix*PLAYER_ACCEL*dt; p.vel[1] += iy*PLAYER_ACCEL*dt
+        else:      p.vel *= math.exp(-PLAYER_FRIC*dt)
+        spd = np.linalg.norm(p.vel)
+        if spd > PLAYER_SPEED: p.vel *= PLAYER_SPEED / spd
+        p.moving = spd > 0.3
+        if spd > 0.01:
+            self._move_to(p, p.xy[0]+p.vel[0]*dt, p.xy[1]+p.vel[1]*dt)
+            self._face(p, p.vel[0], p.vel[1])
+        return Task.cont
+
+    def _tick_ai(self, task):
+        if not self._active(): return Task.cont
+        dt = min(globalClock.getDt(), 0.05)
+        egg_pos   = np.array([[e.getX(), e.getY()] for e in self.eggs]) if self.eggs else None
+        player_xy = self.player.xy.copy()
+        claimed   = {chk.claimed_egg: chk
+                     for chk in self.chickens
+                     if not chk.is_player and chk.claimed_egg in self.eggs}
+
+        for chk in self.chickens:
+            if chk.is_player: continue
+            chk.lag_timer -= dt; do_retarget = chk.lag_timer <= 0
+            if do_retarget: chk.lag_timer = chk.reaction_lag
+
+            chk.speed = (chk.base_speed * chk.sprint_mult
+                         if chk.sprint_timer > 0 else chk.base_speed)
+            if chk.sprint_timer > 0: chk.sprint_timer -= dt
+
+            if do_retarget:
+                if chk.claimed_egg not in self.eggs: chk.claimed_egg = None
+                if egg_pos is not None and len(egg_pos):
+                    dists   = np.linalg.norm(egg_pos - chk.xy, axis=1)
+                    pen     = np.array([130.0 if (e in claimed and claimed[e] is not chk)
+                                        else 0.0 for e in self.eggs])
+                    p_dists = np.linalg.norm(egg_pos - player_xy, axis=1)
+                    thr     = np.maximum(0.0, (8.0 - p_dists) * 5.5)
+                    norms   = np.linalg.norm(egg_pos, axis=1)
+                    scores  = dists + pen + thr - norms * 0.25
+
+                    if chk.claimed_egg is not None:
+                        if chk.claimed_egg in self.eggs:
+                            cidx = self.eggs.index(chk.claimed_egg)
+                            if p_dists[cidx] < AI_STEAL_R:
+                                chk.claimed_egg = None
+                        else:
+                            chk.claimed_egg = None
+
+                    if chk.claimed_egg is None:
+                        chk.claimed_egg = self.eggs[int(np.argmin(scores))]
+                        claimed[chk.claimed_egg] = chk
+                    chk.target_xy = np.array([chk.claimed_egg.getX(), chk.claimed_egg.getY()])
+                else:
+                    chk.claimed_egg = None
+                    if np.linalg.norm(chk.target_xy - chk.xy) < 0.5:
+                        chk.target_xy = np.array(rand_world())
+
+            if chk.pause_timer > 0:
+                chk.pause_timer -= dt; chk.moving = False; chk.wobble_time += dt
+                chk.model.setH(chk.model.getH() + math.sin(chk.wobble_time*4.0)*18*dt*60)
+                continue
+
+            chk.wander_timer -= dt
+            if chk.wander_timer <= 0:
+                chk.wander_angle = (chk.wander_angle
+                                    + random.uniform(10,45)*random.choice((-1,1))
+                                    + 180) % 360 - 180
+                chk.wander_timer = random.uniform(0.30, 1.0)
+                if random.random() < AI_SPRINT_P and chk.sprint_timer <= 0:
+                    chk.sprint_mult  = AI_SPRINT_MUL * random.uniform(0.90, 1.10)
+                    chk.sprint_timer = random.uniform(*AI_SPRINT_DUR)
+                if random.random() < AI_PAUSE_P:
+                    chk.pause_timer = random.uniform(*AI_PAUSE_DUR)
+                    chk.wobble_time = 0.0
+
+            to_egg   = chk.target_xy - chk.xy
+            egg_dist = np.linalg.norm(to_egg)
+            to_egg_n = (to_egg / egg_dist) if egg_dist > 0 else np.zeros(2)
+            wr        = math.radians(chk.wander_angle)
+            wnd       = np.array([math.sin(wr), math.cos(wr)])
+            ww        = min(0.25, egg_dist / 24.0)
+            direction = (1-ww)*to_egg_n + ww*wnd
+            dlen      = np.linalg.norm(direction)
+            if dlen > 0: direction /= dlen
+
+            chk.vel = (chk.vel
+                       + (direction*chk.speed - chk.vel)
+                       * min(1.0, AI_ACCEL*dt / max(chk.speed, 0.1)))
+            if egg_dist < 2.6:
+                chk.vel *= max(0.12, egg_dist / 2.6)
+
+            spd = np.linalg.norm(chk.vel)
+            if spd > 0.05:
+                self._move_to(chk, chk.xy[0]+chk.vel[0]*dt, chk.xy[1]+chk.vel[1]*dt)
+                chk.moving = True
+                self._face(chk, chk.vel[0], chk.vel[1], AI_TURN)
+                chk.wobble_time += dt
+            else:
+                chk.moving = False; chk.vel[:] = 0.0
+
+            r = random.random()
+            if r < 0.0012:   self._do_jump(chk)
+            elif r < 0.0025: self._do_cluck(chk)
+
+        return Task.cont
+
+    def _tick_eggs(self, task):
+        if self.paused or self.game_over or not self.game_started: return Task.cont
+        surviving = []
+        for egg in self.eggs:
+            ep = egg.getPos(); picked = False
+            for chk in self.chickens:
+                cp = chk.model.getPos()
+                if math.hypot(ep.x-cp.x, ep.y-cp.y) < PICKUP_DIST:
+                    chk.score += 1; self._do_eat(chk)
+                    if not chk.is_player and chk.claimed_egg is egg:
+                        chk.claimed_egg = None
+                    egg.removeNode(); self._refresh_scoreboard()
+                    picked = True; break
+            if not picked: surviving.append(egg)
+        self.eggs = surviving
+        while len(self.eggs) < EGGS_MIN:
+            self._drop_egg(random.uniform(WL+2, WR-2), random.uniform(WB+2, WT-2))
+        return Task.cont
+
+    def _tick_animation(self, task):
+        if self.paused or self.game_over: return Task.cont
+        dt = min(globalClock.getDt(), 0.05)
+        for chk in self.chickens:
+            m = chk.model
+            if chk.jumping: continue
+            if chk.is_actor:
+                if not (chk.is_player and chk.anim_locked):
+                    if chk.moving:
+                        want = pick_walk(chk.clips)
+                    else:
+                        chk.idle_timer -= dt
+                        if chk.idle_timer <= 0:
+                            if chk.idle_clip == "Idle2":
+                                chk.idle_clip  = pick_idle(chk.clips) or "Idle"
+                                chk.idle_timer = random.uniform(4.0, 9.0)
+                            else:
+                                if "Idle2" in chk.clips and random.random() < 0.18:
+                                    chk.idle_clip  = "Idle2"
+                                    chk.idle_timer = random.uniform(2.0, 4.0)
+                                else:
+                                    chk.idle_clip  = pick_idle(chk.clips) or "Idle"
+                                    chk.idle_timer = random.uniform(4.0, 9.0)
+                        want = chk.idle_clip
+                    if want and chk.playing != want and want in chk.clips:
+                        chk.model.loop(want); chk.playing = want
+                if chk.is_player:
+                    spd = np.linalg.norm(chk.vel) / PLAYER_SPEED
+                    if spd > 0 and chk.playing:
+                        try: chk.model.setPlayRate(max(0.3, spd), chk.playing)
+                        except: pass
+                continue
+            if chk.moving:
+                chk.walk_time += (dt * BOB_SPD
+                                  * (np.linalg.norm(chk.vel) if chk.is_player else PLAYER_SPEED)
+                                  / PLAYER_SPEED)
+                t = chk.walk_time; s = math.sin(t) * LEG_SWING
+                m.setZ(chk.ground_z + abs(math.sin(t))*BOB_H)
+                m.setR(math.sin(t)*BODY_TILT); m.setP(math.sin(t*2)*BODY_PITCH)
+                if chk.leg_l: chk.leg_l.setP(-s)
+                if chk.leg_r: chk.leg_r.setP(s)
+            else:
+                m.setZ(m.getZ() + (chk.ground_z - m.getZ())*.2)
+                m.setR(m.getR()*.8); m.setP(m.getP()*.8)
+                chk.walk_time = 0
+                if chk.leg_l: chk.leg_l.setP(chk.leg_l.getP()*.8)
+                if chk.leg_r: chk.leg_r.setP(chk.leg_r.getP()*.8)
+        return Task.cont
+
+    def _tick_camera(self, task):
+        if self.game_over: return Task.cont
+        ideal = self.player.model.getPos() + LVector3(0, -28, 16)
+        self.camera.setPos(self.camera.getPos() + (ideal - self.camera.getPos())*.06)
+        self.camera.lookAt(self.player.model)
+        return Task.cont
+
+    # ── End game ──────────────────────────────────────────────────────────────
+
+    def _end_game_from_timer(self):
+        self._end_game(max(self.chickens, key=lambda c: c.score))
+
+    def _play_endgame_anim(self, chk, is_winner):
+        if not chk.is_actor: return
+        chk.anim_locked = False
+        clips = chk.clips
+        if is_winner:
+            clip = next((c for c in ("Screaming","Idle2","Idle1","Idle") if c in clips), None)
+            if clip: chk.model.loop(clip); chk.playing = clip
+        else:
+            clip = next((c for c in ("Dying","Idle","Standing") if c in clips), None)
+            if clip: (chk.model.play if clip=="Dying" else chk.model.loop)(clip); chk.playing = clip
+
+    def _end_game(self, winner):
+        if self.game_over: return
+        self.game_over = True
+        if not self._endgame_triggered:
+            self._endgame_triggered = True
+            for chk in self.chickens: self._play_endgame_anim(chk, chk is winner)
+        if self.bgm and self.music_on: self.bgm.setVolume(0.15)
+        self.winner_label.setText(winner.name.upper())
+        for i, (chk, (rt, nt, st)) in enumerate(zip(
+                sorted(self.chickens, key=lambda c: c.score, reverse=True),
+                self.leaderboard_rows)):
+            fill, icon = self.leaderboard_fills[i], self.leaderboard_icons[i]
+            rt.setText(str(i+1)); nt.setText(chk.name.upper()); st.setText(f"{chk.score} pts")
+            if i < 2:
+                fill["frameColor"] = row_gold
+                if icon: icon.setColorScale(.82,.50,0,1)
+                for t in (rt, nt, st): t.setFg(dark_txt)
+            else:
+                fill["frameColor"] = row_dark
+                if icon: icon.setColorScale(.14,.14,.18,1)
+                rt.setFg(gold); nt.setFg(chk.color); st.setFg(white)
+        self.gameover_screen.show()
+
+    # ── Keys ─────────────────────────────────────────────────────────────────
+
+    def _setup_keys(self):
+        self.held = {k: False for k in "wasd"}
+        for k in self.held:
+            self.accept(k, self.held.update, [{k: True}])
+            self.accept(f"{k}-up", self.held.update, [{k: False}])
+        for key, fn in (("space", self._do_jump), ("c", self._do_cluck),
+                        ("e", self._do_eat),       ("q", self._do_strut)):
+            self.accept(key, lambda f=fn: self._active() and f(self.player))
+        for key, clip, loop in ANIM_KEYS:
+            self.accept(key, lambda c=clip, l=loop: self._do_player_anim(c, l))
+        self.accept("r", self._release_anim_lock)
+        self.accept("escape", self._key_escape)
+
+    def _key_escape(self):
+        if self.game_over or self.paused:
+            self.userExit()
+        else:
+            self.paused = True
+            self.pause_screen.show()
+            if hasattr(self, "game_timer") and self.game_timer:
+                self.game_timer.hide()
+
+    def _resume(self):
+        self.paused = False
+        self.pause_screen.hide(); self.options_screen.hide()
+        if hasattr(self, "game_timer") and self.game_timer:
+            self.game_timer.show()
+
+    def _restart(self):
+        for n in self.TASK_NAMES: self.taskMgr.remove(n)
+        for egg in self.eggs:
+            try: egg.removeNode()
+            except: pass
+        for chk in self.chickens:
+            try:
+                if chk.is_actor: chk.model.cleanup()
+                chk.model.removeNode()
+            except: pass
+        try:
+            if self.tree: self.tree.removeNode()
+        except: pass
+        self._destroy_ui(); kg = self.key_guide_on
+        for k in self.held: self.held[k] = False
+        self._place_tree(); self._spawn_chickens(); self._spawn_eggs()
+        self._reset_state(); self.key_guide_on = kg
+        self._build_ui(); self._start_tasks(); self._toggle_music(self.music_on)
+        if self.key_guide_on and hasattr(self, "anim_hud") and self.anim_hud:
+            self.anim_hud.show()
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+
+    def _do_jump(self, chk):
+        if chk.jumping: return
+        chk.jumping = True; chk.model.setR(0); chk.model.setP(0)
+        used = play_anim(chk.model, chk.clips, JUMP, loop=False) if chk.is_actor else None
+        if not used:
+            sx, sy = chk.model.getX(), chk.model.getY()
+            peak, half = chk.ground_z + JUMP_H, JUMP_T/2
+            Sequence(
+                LerpPosInterval(chk.model, half, (sx,sy,peak),
+                                startPos=(sx,sy,chk.ground_z), blendType="easeOut"),
+                LerpPosInterval(chk.model, half, (sx,sy,chk.ground_z),
+                                startPos=(sx,sy,peak), blendType="easeIn"),
+            ).start()
+        def land(task):
+            chk.jumping = False
+            chk.model.setPos(chk.model.getX(), chk.model.getY(), chk.ground_z)
+            chk.model.setR(0); chk.model.setP(0)
+            if chk.leg_l: chk.leg_l.setP(0)
+            if chk.leg_r: chk.leg_r.setP(0)
+            chk.playing = None; return Task.done
+        self.taskMgr.doMethodLater(JUMP_T+.05, land, f"land_{chk.name}")
+
+    def _do_cluck(self, chk):
+        h = chk.model.getH()
+        hpr_seq(chk.model,.07,(h,12,-8),(h,-12,8),(h,10,-6),(h,-10,6),(h,8,-4),(h,0,0)).start()
+        if chk.leg_l and chk.leg_r:
+            hpr_seq(chk.leg_l,.06,(0,-40,0),(0,40,0),(0,-30,0),(0,0,0)).start()
+            hpr_seq(chk.leg_r,.06,(0,40,0),(0,-40,0),(0,30,0),(0,0,0)).start()
+
+    def _do_eat(self, chk):
+        if chk.jumping: return
+        if chk.is_actor:
+            chk.playing = None; chk.play_clip(EAT, loop=False)
+            self.taskMgr.doMethodLater(
+                1.0, lambda t: setattr(chk,"playing",None) or Task.done,
+                f"eat_{chk.name}")
+        else:
+            h = chk.model.getH()
+            hpr_seq(chk.model,.10,(h,30,0),(h,-5,0),(h,30,0),(h,-5,0),(h,30,0),(h,0,0)).start()
+
+    def _do_strut(self, chk):
+        if chk.jumping: return
+        if chk.is_actor: chk.playing = None; chk.play_clip(WALK)
+        else:
+            h = chk.model.getH(); S = LEG_SWING
+            hpr_seq(chk.model,.09,(h,0,14),(h,0,-14),(h,0,14),(h,0,-14),(h,0,14),(h,0,-14),(h,0,0)).start()
+            if chk.leg_l and chk.leg_r:
+                hpr_seq(chk.leg_l,.09,(0,-S,0),(0,S,0),(0,-S,0),(0,S,0),(0,-S,0),(0,S,0),(0,0,0)).start()
+                hpr_seq(chk.leg_r,.09,(0,S,0),(0,-S,0),(0,S,0),(0,-S,0),(0,S,0),(0,-S,0),(0,0,0)).start()
+
+    def _do_player_anim(self, clip, loop=True):
+        if not self._active() or not self.player.is_actor: return
+        p = self.player
+        if clip not in p.clips: return
+        p.model.loop(clip) if loop else p.model.play(clip)
+        p.playing = clip; p.anim_locked = True; self._update_anim_hud(clip)
+
+    def _release_anim_lock(self):
+        if not self._active(): return
+        p = self.player; p.anim_locked = False; p.playing = None
+        self._update_anim_hud(None)
+
+    # ── Task registration ─────────────────────────────────────────────────────
+
+    def _start_tasks(self):
+        for fn, name in (
+            (self._tick_player,    "MovePlayer"),
+            (self._tick_ai,        "MoveAI"),
+            (self._tick_eggs,      "PickupEggs"),
+            (self._tick_animation, "Animate"),
+            (self._tick_camera,    "MoveCamera"),
+            (self._tick_countdown, "Countdown"),
+            (self._tick_timer_hud, "TimerUpdate"),
+        ):
+            self.taskMgr.add(fn, name)
+        self.taskMgr.doMethodLater(1.0, self._on_game_start, "StartGame")
+
+    # ── UI helpers ────────────────────────────────────────────────────────────
+
+    def _panel(self, parent, size, color, pos=(0,0,0)):
+        return DirectFrame(parent=parent, frameSize=size, frameColor=color, pos=pos)
+
+    def _label(self, parent, text, pos, size, color,
+               align=TextNode.ACenter, font=None, editable=False):
+        return OnscreenText(text=text, parent=parent, pos=pos, scale=size, fg=color,
+                            align=align, font=font or self.font, mayChange=editable)
+
+    def _button(self, parent, text, pos, size, action,
+                text_color=white, text_size=.052, bg=(0,0,0,0)):
+        return DirectButton(parent=parent, text=text, text_fg=text_color,
+                            text_scale=text_size, text_font=self.font,
+                            frameColor=bg, frameSize=size, pos=pos, command=action,
+                            relief=0 if bg==(0,0,0,0) else 1,
+                            rolloverSound=None, clickSound=None)
+
+    def _circle(self, parent, radius, color, pos3):
+        m = load_model(self.loader, "models/misc/sphere", "models/smiley")
+        if m:
+            m.reparentTo(parent); m.setScale(radius, .001, radius)
+            m.setPos(*pos3); m.setColorScale(*color); m.setLightOff()
+        return m
+
+    def _person_icon(self, parent, cx, cy, r, color):
+        self._circle(parent, r*.38, color, (cx, 0, cy+r*.3))
+        body = load_model(self.loader, "models/misc/sphere", "models/smiley")
+        if body:
+            body.reparentTo(parent); body.setScale(r*.56, .001, r*.35)
+            body.setPos(cx, 0, cy-r*.22); body.setColorScale(*color); body.setLightOff()
+
+    def _bordered_btn(self, parent, pw, bh, y):
+        self._panel(parent, (-pw, pw, -bh, bh), yellow, (0, 0, y))
+        self._panel(parent, (-pw+.006, pw-.006, -bh+.006, bh-.006), btn_dark, (0, 0, y))
+
+    # ── UI build / destroy ────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self._build_scoreboard(); self._build_pause_screen()
+        self._build_options_screen(); self._build_gameover_screen()
+        self._build_anim_hud()
+        self.game_timer = GameTimer(
+            parent=self.aspect2d, total_secs=GAME_LEN, font=self.font,
+            font_ui=self.font_ui, font_digital=self.font_digital,
+            on_expire=self._end_game_from_timer)
+
+    def _destroy_ui(self):
+        for attr in ("scoreboard","pause_screen","gameover_screen","options_screen","anim_hud"):
+            n = getattr(self, attr, None)
+            if n:
+                try: n.destroy()
+                except: pass
+                setattr(self, attr, None)
+        if hasattr(self, "game_timer") and self.game_timer:
+            self.game_timer.destroy(); self.game_timer = None
+        self.score_labels = []; self.anim_hud_rows = []
+
+    def _build_scoreboard(self):
+        pw, rh, gap, hh, b = .30, .042, .007, .032, .004
+        first_y = -hh*2 - gap
+        bottom  = first_y - len(self.chickens)*(rh*2) - (len(self.chickens)-1)*gap - .022
+        sb = self._panel(self.aspect2d, (-pw-b, pw+b, bottom, hh+.03), (.08,.08,.08,.97), (-1.33,0,.95))
+        self.scoreboard = sb
+
+        # Corner accents (L-brackets)
+        for cx, cy, sx, sy in ((-pw, hh+.03, .10, -.006), (-pw, hh+.03, -.006, -.07),
+                                (pw, bottom, -.10, .006),  (pw, bottom, .006, .07)):
+            self._panel(sb, (0, sx, 0, sy), yellow, (cx, 0, cy))
+
+        self._panel(sb, (-.20, .20, -hh, hh), yellow, (0, 0, -hh))
+        self._label(sb, "SCOREBOARD", (0, -hh-.012), .032, (.06,.06,.06,1))
+
+        self.score_labels = []; y = first_y - rh
+        for chk in self.chickens:
+            self._panel(sb, (-pw+b, pw-b, -rh, rh), yellow, (0, 0, y))
+            self._panel(sb, (-pw+b*2, pw-b*2, -rh+b, rh-b), panel_row, (0, 0, y))
+            self._panel(sb, (0, .040, -.026, .026), chk.color, (-pw+.016, 0, y))
+            self._label(sb, chk.name.upper(), (-pw+.072, y-.012), .028, white, align=TextNode.ALeft)
+            lbl = self._label(sb, "0", (pw-.036, y-.006), .038, yellow, align=TextNode.ARight, editable=True)
+            self.score_labels.append(lbl)
+            self._label(sb, "PTS", (pw-.036, y-.030), .016, (.65,.65,.65,1),
+                        align=TextNode.ARight, font=self.font_ui)
+            y -= rh*2 + gap
+
+    def _refresh_scoreboard(self):
+        for i, chk in enumerate(self.chickens):
+            self.score_labels[i].setText(str(chk.score))
+
+    def _build_pause_screen(self):
+        bh, pw = .072, .52
+        ps = self._panel(self.aspect2d, (-2,2,-1.5,1.5), (.04,.04,.04,.92))
+        self.pause_screen = ps
+        self._label(ps, "PAUSED", (0, .72), .115, yellow)
+        for i, (label, action) in enumerate([
+            ("RESUME",  self._resume),
+            ("RESTART", self._restart),
+            ("OPTIONS", lambda: (ps.hide(), self.options_screen.show(), self._sync_options())),
+            ("EXIT",    self.userExit),
+        ]):
+            y = .32 - i*(bh*2+.010)
+            self._bordered_btn(ps, pw, bh, y)
+            self._button(ps, label, (0,0,y), (-pw,pw,-bh,bh), action)
+        ps.hide()
+
+    def _build_options_screen(self):
+        pw, rh = .52, .072
+        os_ = self._panel(self.aspect2d, (-2,2,-1.5,1.5), (.04,.04,.04,.92))
+        self.options_screen = os_
+        self._label(os_, "OPTIONS", (0, .72), .115, yellow)
+        for ry, label, attr_on, attr_off, toggle_fn in (
+            (.22, "MUSIC",     "music_on_btn",    "music_off_btn",
+             lambda v: (self._toggle_music(v), self._sync_options())),
+            (.03, "KEY GUIDE", "keyguide_on_btn", "keyguide_off_btn",
+             lambda v: (self._toggle_key_guide(v), self._sync_options())),
+        ):
+            self._bordered_btn(os_, pw, rh, ry)
+            self._label(os_, label, (-.14, ry-.022), .046, white, align=TextNode.ARight)
+            for lbl, x, on in (("ON", .20, True), ("OFF", .38, False)):
+                btn = self._button(os_, lbl, (x,0,ry), (-.10,.10,-.048,.048),
+                                   lambda v=on, fn=toggle_fn: fn(v),
+                                   text_color=dark_txt, bg=yellow)
+                setattr(self, attr_on if on else attr_off, btn)
+        self._bordered_btn(os_, pw, rh, -.18)
+        self._button(os_, "< BACK", (0,0,-.18), (-pw,pw,-rh,rh),
+                     lambda: (os_.hide(), self.pause_screen.show()))
+        os_.hide(); self._sync_options()
+
+    def _sync_options(self):
+        for a_on, a_off, flag in (
+            ("music_on_btn",    "music_off_btn",    self.music_on),
+            ("keyguide_on_btn", "keyguide_off_btn", self.key_guide_on),
+        ):
+            if hasattr(self, a_on):
+                getattr(self, a_on)["frameColor"]  = (.20,.85,.20,1) if flag     else (.55,.55,.55,1)
+            if hasattr(self, a_off):
+                getattr(self, a_off)["frameColor"] = (.85,.20,.20,1) if not flag else (.55,.55,.55,1)
+
+    sync_option_buttons = sync_music_buttons = _sync_options
+
+    def _toggle_key_guide(self, on):
+        self.key_guide_on = on
+        if hasattr(self, "anim_hud") and self.anim_hud:
+            self.anim_hud.show() if on else self.anim_hud.hide()
+
+    def _build_anim_hud(self):
+        rh, pw = 0.044, 0.36; ax, ay = 1.04, 0.30
+        shw, scx = (pw-0.012)/2, -pw/2
+        hud = self._panel(self.aspect2d,
+                          (-pw, .008, -(len(ANIM_KEYS)+1)*rh, rh*1.7),
+                          (0.07,0.07,0.09,0.93), (ax,0,ay))
+        self.anim_hud = hud
+        self._panel(hud, (-shw, shw, 0, rh*1.7), (0.20,0.16,0.02,1), (scx,0,0))
+        self._label(hud, "ANIMATIONS",     (scx, rh*1.7*.62), 0.031, yellow)
+        self._label(hud, "R = back to auto",(scx, rh*1.7*.20), 0.019, grey, font=self.font_ui)
+
+        self.anim_hud_rows = []; y = 0
+        for key, clip, loop in ANIM_KEYS:
+            y -= rh; cz = y + rh/2
+            bg = self._panel(hud, (-shw, shw, -rh*.44, rh*.44), panel_row, (scx, 0, cz))
+            self._label(hud, f"[{key.upper()}]", (scx-shw+.010, cz-rh*.06),
+                        0.026, yellow, align=TextNode.ALeft, font=self.font_ui)
+            self._label(hud, clip, (scx-shw+.098, cz-rh*.06),
+                        0.026, white, align=TextNode.ALeft, font=self.font_ui)
+            self.anim_hud_rows.append((bg, clip))
+
+        y -= rh; cz = y + rh/2; gc = (0.40,1.00,0.40,1)
+        self._panel(hud, (-shw, shw, -rh*.44, rh*.44), (0.08,0.18,0.08,0.97), (scx, 0, cz))
+        self._label(hud, "[R]",          (scx-shw+.010, cz-rh*.06), 0.026, gc,
+                    align=TextNode.ALeft, font=self.font_ui)
+        self._label(hud, "Auto (resume)", (scx-shw+.098, cz-rh*.06), 0.026, gc,
+                    align=TextNode.ALeft, font=self.font_ui)
+        hud.hide()
+
+    def _update_anim_hud(self, active_clip=None):
+        if not hasattr(self, "anim_hud_rows"): return
+        for bg, clip in self.anim_hud_rows:
+            bg["frameColor"] = (0.24,0.18,0.02,0.97) if clip==active_clip else panel_row
+
+    def _build_gameover_screen(self):
+        pw, top, bot, b = .58, .95, -.92, .016
+        gs = self._panel(self.aspect2d, (-2,2,-1.5,1.5), (.04,.04,.05,.92))
+        self.gameover_screen = gs
+        self._panel(gs, (-pw-b, pw+b, bot-b, top+b), white)
+        self._panel(gs, (-pw, pw, bot, top), lb_panel)
+
+        bh, by = .08, top-.08
+        self._panel(gs, (-pw, pw, -bh, bh), lb_banner, (0,0,by))
+        for dz in (bh, -bh): self._panel(gs, (-pw, pw, -.006, .006), gold, (0,0,by+dz))
+        self._label(gs, "LEADERBOARD", (0, by-.024), .064, gold)
+
+        ay2, ar = .60, .115
+        for r, c in ((ar+.02, gold_dark), (ar, gold), (ar-.016, (.88,.58,0,1))):
+            self._circle(gs, r, c, (0, 0, ay2))
+        self._person_icon(gs, 0, ay2+.01, ar-.025, (1,1,1,.92))
+
+        badge_y = ay2 - ar + .01
+        self._panel(gs, (-.06, .06, -.028, .028), gold_dark, (0,0,badge_y))
+        self._label(gs, "1", (0, badge_y-.01), .036, dark_txt)
+
+        tag_y = ay2 - ar - .05
+        self._panel(gs, (-.18, .18, -.026, .026), gold, (0,0,tag_y))
+        self.winner_label = self._label(gs, "", (0, tag_y-.01), .032, dark_txt, editable=True)
+
+        self.leaderboard_fills = []; self.leaderboard_icons = []; self.leaderboard_rows = []
+        rh, rg, rw, ix = .052, .009, pw-.03, -(pw-.03)+.115
+        for i in range(len(self.chickens)):
+            y = (tag_y-.075) - i*(rh*2+rg)
+            self._panel(gs, (-rw, rw, -rh, rh), gold, (0,0,y))
+            fill = self._panel(gs, (-rw+.006, rw-.006, -rh+.006, rh-.006), row_dark, (0,0,y))
+            self.leaderboard_fills.append(fill)
+            self._circle(gs, .044, gold, (ix, 0, y))
+            self.leaderboard_icons.append(self._circle(gs, .038, row_dark, (ix, 0, y)))
+            self._person_icon(gs, ix, y, .032, (1,1,1,.88))
+            self.leaderboard_rows.append((
+                self._label(gs, "", (-rw+.022, y-.016), .030, white,
+                            align=TextNode.ALeft, editable=True),
+                self._label(gs, "", (-rw+.175, y-.016), .038, white,
+                            align=TextNode.ALeft, editable=True),
+                self._label(gs, "", ( rw-.022, y-.016), .034, white,
+                            align=TextNode.ARight, editable=True),
+            ))
+
+        btn_y, hw = bot+.105, rw-.04
+        self._panel(gs, (-hw-.008, hw+.008, -.068, .068), gold_dark, (0,0,btn_y))
+        self._button(gs, "PLAY AGAIN", (0,0,btn_y), (-hw,hw,-.06,.06),
+                     self._restart, text_color=dark_txt, bg=gold)
+        self._button(gs, "QUIT", (0,0,btn_y-.110), (-.12,.12,-.026,.026),
+                     self.userExit, text_color=grey, text_size=.030)
+        gs.hide()
+
+
+if __name__ == "__main__":
+    EggCollectorGame().run()
