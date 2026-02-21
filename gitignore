@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Panda3D generated files
+*.bam
+*.bam.pz
+*.egg.pz
+*.ptf
+*.log
+
+# Downloaded fonts (auto-fetched at runtime)
+Rajdhani-Bold.ttf
+Rajdhani-SemiBold.ttf
+Orbitron-Bold.ttf
+
+# User assets (binary — track in LFS or omit)
+*.glb
+*.gltf
+*.WAV
+*.wav
+*.mp3
+*.ogg
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
